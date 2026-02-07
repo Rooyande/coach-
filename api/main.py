@@ -1,26 +1,27 @@
+from datetime import timedelta
 from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
+from sqlalchemy import desc
 
 from .config import settings
 from .db import Base, engine, get_db
 from . import models, schemas, services
+from .charts import StatsCard, render_stats_card_png, render_trend_png
 
 app = FastAPI(title="Dopamine Coach API", version="1.0.0")
 
 
-# ---------- Startup ----------
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
 
 
-# ---------- Auth ----------
 def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
     if not x_api_key or x_api_key != settings.api_key:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-# ---------- Routes ----------
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -117,3 +118,47 @@ def get_achievements(user_id: int, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return services.list_achievements(db, user_id=user_id)
+
+
+@app.get("/users/{user_id}/stats.png", dependencies=[Depends(require_api_key)])
+def get_stats_png(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == user_id, models.User.is_active == True).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    s = services.compute_stats(db, user_id=user_id)
+    card = StatsCard(
+        user_display_name=user.display_name,
+        period_label="All time",
+        streak=s["streak"],
+        adherence_percent=s["adherence_percent"],
+        score=s["score"],
+        total_checkins=s["total_checkins"],
+        slips=s["slips"],
+        healthy_minutes_total=s["healthy_minutes_total"],
+    )
+    png = render_stats_card_png(card)
+    return Response(content=png, media_type="image/png")
+
+
+@app.get("/users/{user_id}/trend.png", dependencies=[Depends(require_api_key)])
+def get_trend_png(user_id: int, days: int = 14, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == user_id, models.User.is_active == True).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    days = max(2, min(int(days), 90))
+
+    # collect last N days checkins and compute per-day score increment
+    rows = db.query(models.CheckIn.day, models.CheckIn.slip, models.CheckIn.healthy_minutes).filter(
+        models.CheckIn.user_id == user_id
+    ).order_by(desc(models.CheckIn.day)).limit(days).all()
+
+    rows = list(reversed(rows))
+    points = []
+    for d, slip, healthy in rows:
+        inc = 10 - (15 if slip else 0) + (int(healthy or 0) // 30)
+        points.append((d, inc))
+
+    png = render_trend_png(points, title=f"Score Trend (last {len(points)} check-ins)")
+    return Response(content=png, media_type="image/png")
